@@ -5,71 +5,38 @@ use byteorder::{BigEndian, ReadBytesExt};
 
 pub const FILE_MAGIC: u32 = 0x425047fb;
 
-/*
-heic_file() {
-
-     file_magic                                                  u(32)
-
-     pixel_format                                                u(3)
-     alpha1_flag                                                 u(1)
-     bit_depth_minus_8                                           u(4)
-
-     color_space                                                 u(4)
-     extension_present_flag                                      u(1)
-     alpha2_flag                                                 u(1)
-     limited_range_flag                                          u(1)
-     animation_flag                                              u(1)
-     
-     picture_width                                               ue7(32)
-     picture_height                                              ue7(32)
-     
-     picture_data_length                                         ue7(32)
-     if (extension_present_flag)  
-         extension_data_length                                   ue7(32)
-         extension_data()
-     }
-
-     hevc_header_and_data()
-}
-
-*/
-
-pub fn ue7_decode(bytes: &[u8]) -> Option<usize> {
+/// Decodes a ue7(n) value.
+/// 
+/// ue7(n) is an unsigned integer of at most n bits stored on a variable
+/// number of bytes. All the bytes except the last one have a '1' as
+/// their first bit. The unsigned integer is represented as the
+/// concatenation of the remaining 7 bit codewords. Only the shortest
+/// encoding for a given unsigned integer shall be accepted by the
+/// decoder (i.e. the first byte is never 0x80). Example:
+/// 
+/// Encoded bytes       Unsigned integer value
+/// 0x08                8
+/// 0x84 0x1e           542
+/// 0xac 0xbe 0x17      728855
+pub fn ue7_decode<R: ReadBytesExt>(bytes: &mut R, max_bytes: usize) -> Result<usize, BpgDecodeError> {
     
-    #[derive(Debug, Copy, Clone)]
-    enum Bit { 
-        Zero,
-        One,
-    }
+    let mut bit_vec = Vec::<bool>::with_capacity(16);
 
-    let mut bit_vec = Vec::<Bit>::with_capacity(bytes.len() * 8);
+    let mut is_last_byte = false;
+    let mut read_bytes = 0;
 
-    #[inline]
-    fn bool_to_bit(a: bool) -> Bit {
-        if a { Bit::One } else { Bit::Zero }
-    }
+    while !is_last_byte && read_bytes <= max_bytes {
+        let b = bytes.read_u8()?;
+        bit_vec.push((b & 0b01000000) >> 6 != 0);
+        bit_vec.push((b & 0b00100000) >> 5 != 0);
+        bit_vec.push((b & 0b00010000) >> 4 != 0);
+        bit_vec.push((b & 0b00001000) >> 3 != 0);
+        bit_vec.push((b & 0b00000100) >> 2 != 0);
+        bit_vec.push((b & 0b00000010) >> 1 != 0);
+        bit_vec.push((b & 0b00000001)      != 0);
 
-    #[inline]
-    fn bit_to_u8(a: Bit) -> u8 {
-        match a {
-            Bit::One => 1,
-            Bit::Zero => 0,
-        }
-    }
-
-    for b in bytes {
-        // [1, _, _, _, _, _, _, _]
-        let is_last_byte = (b & 0b10000000) >> 7 != 1;
-
-        bit_vec.push(bool_to_bit((b & 0b01000000) >> 6 != 0));
-        bit_vec.push(bool_to_bit((b & 0b00100000) >> 5 != 0));
-        bit_vec.push(bool_to_bit((b & 0b00010000) >> 4 != 0));
-        bit_vec.push(bool_to_bit((b & 0b00001000) >> 3 != 0));
-        bit_vec.push(bool_to_bit((b & 0b00000100) >> 2 != 0));
-        bit_vec.push(bool_to_bit((b & 0b00000010) >> 1 != 0));
-        bit_vec.push(bool_to_bit((b & 0b00000001)      != 0));
-
-        if is_last_byte { break; }
+        is_last_byte = (b & 0b10000000) >> 7 != 1;
+        read_bytes += 1;
     }
 
     // bit_vec now contains a concatenation of 7-bit Bits
@@ -83,7 +50,7 @@ pub fn ue7_decode(bytes: &[u8]) -> Option<usize> {
     let max_len_bits = if is_64_bit { 64 } else { 32 };
 
     if next_power_of_two > max_len_bits {
-        return None;
+        return Err(BpgDecodeError::OverflowingUnsignedInteger(next_power_of_two));
     }
 
     let mut final_vec = vec![0; next_power_of_two];
@@ -91,7 +58,7 @@ pub fn ue7_decode(bytes: &[u8]) -> Option<usize> {
     assert!(bit_vec.len() <= final_vec.len());
 
     for (i, b) in bit_vec.into_iter().enumerate() {
-        final_vec[remaining_len + i] = bit_to_u8(b);
+        final_vec[remaining_len + i] = b as u8;
     }
 
     assert!(final_vec.len() % 8 == 0);
@@ -116,22 +83,25 @@ pub fn ue7_decode(bytes: &[u8]) -> Option<usize> {
         final_num |= (final_vec[i] as usize) << (max_len_bits - i - 1);
     }
 
-    Some(final_num)
+    Ok(final_num)
 }
 
 #[test]
 fn ue7_decode_test_1() {
-    assert_eq!(ue7_decode(&[0x08]), Some(8));
+    use std::io::Cursor;
+    assert_eq!(ue7_decode(&mut Cursor::new(vec![0x08]), 4).unwrap(), 8);
 }
 
 #[test]
 fn ue7_decode_test_2() {
-    assert_eq!(ue7_decode(&[0x84, 0x1e]), Some(542));
+    use std::io::Cursor;
+    assert_eq!(ue7_decode(&mut Cursor::new(vec![0x84, 0x1e]), 4).unwrap(), 542);
 }
 
 #[test]
 fn ue7_decode_test_3() {
-    assert_eq!(ue7_decode(&[0xac, 0xbe, 0x17]), Some(728855));
+    use std::io::Cursor;
+    assert_eq!(ue7_decode(&mut Cursor::new(vec![0xac, 0xbe, 0x17]), 4).unwrap(), 728855);
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +113,8 @@ pub struct BpgFile {
     pub extension_present: ExtensionPresent,
     pub limited_range: HasLimitedRange,
     pub animation: AnimationFlag,
+    pub width: usize,
+    pub height: usize,
 }
 
 #[derive(Debug)]
@@ -155,6 +127,7 @@ pub enum BpgDecodeError {
     /// The pixel_format was Grayscale, but the ColorSpace was not YCbCr
     ColorSpaceMismatch(u8),
     InvalidColorSpace(u8),
+    OverflowingUnsignedInteger(usize),
     /// Failed to read more bytes, corrupt file
     Io(io::Error),
 }
@@ -469,11 +442,9 @@ pub fn decode<R: ReadBytesExt>(bytes: &mut R) -> Result<BpgFile, BpgDecodeError>
     let has_premutliplied_alpha = HasPremultipliedAlpha::from_u8(third_byte);
     let limited_range_flag = HasLimitedRange::from_u8(third_byte);
     let animation_flag = AnimationFlag::from_u8(third_byte);
-
-    let width_bytes = [bytes.read_u8()?, bytes.read_u8()?, bytes.read_u8()?, bytes.read_u8()?];
     
-    let width = ue7_decode(&width_bytes);
-    println!("width: {:?}", width);
+    let width = ue7_decode(bytes, 4)?;
+    let height = ue7_decode(bytes, 4)?;
 
     Ok(BpgFile {
         pixel_format: pixel_format,
@@ -483,5 +454,7 @@ pub fn decode<R: ReadBytesExt>(bytes: &mut R) -> Result<BpgFile, BpgDecodeError>
         extension_present: extension_present_flag,
         limited_range: limited_range_flag,
         animation: animation_flag,
+        width: width,
+        height: height,
     })
 }
