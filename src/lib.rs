@@ -34,21 +34,104 @@ heic_file() {
 
 */
 
-fn ue7_decode() -> usize {
-/*
-- ue7(n) is an unsigned integer of at most n bits stored on a variable
-  number of bytes. All the bytes except the last one have a '1' as
-  their first bit. The unsigned integer is represented as the
-  concatenation of the remaining 7 bit codewords. Only the shortest
-  encoding for a given unsigned integer shall be accepted by the
-  decoder (i.e. the first byte is never 0x80). Example:
-*/
-/*
-0x08                8
-0x84 0x1e           542
-0xac 0xbe 0x17      728855
-*/
-    728855
+pub fn ue7_decode(bytes: &[u8]) -> Option<usize> {
+    
+    #[derive(Debug, Copy, Clone)]
+    enum Bit { 
+        Zero,
+        One,
+    }
+
+    let mut bit_vec = Vec::<Bit>::with_capacity(bytes.len() * 8);
+
+    #[inline]
+    fn bool_to_bit(a: bool) -> Bit {
+        if a { Bit::One } else { Bit::Zero }
+    }
+
+    #[inline]
+    fn bit_to_u8(a: Bit) -> u8 {
+        match a {
+            Bit::One => 1,
+            Bit::Zero => 0,
+        }
+    }
+
+    for b in bytes {
+        // [1, _, _, _, _, _, _, _]
+        let is_last_byte = (b & 0b10000000) >> 7 != 1;
+
+        bit_vec.push(bool_to_bit((b & 0b01000000) >> 6 != 0));
+        bit_vec.push(bool_to_bit((b & 0b00100000) >> 5 != 0));
+        bit_vec.push(bool_to_bit((b & 0b00010000) >> 4 != 0));
+        bit_vec.push(bool_to_bit((b & 0b00001000) >> 3 != 0));
+        bit_vec.push(bool_to_bit((b & 0b00000100) >> 2 != 0));
+        bit_vec.push(bool_to_bit((b & 0b00000010) >> 1 != 0));
+        bit_vec.push(bool_to_bit((b & 0b00000001)      != 0));
+
+        if is_last_byte { break; }
+    }
+
+    // bit_vec now contains a concatenation of 7-bit Bits
+    // These bits, when concatenated, form the 
+    let bit_len = bit_vec.len();
+    let remaining_len = 8 - (bit_len % 8); // probably not correct
+    let next_power_of_two = bit_len + remaining_len;
+
+    // how many bytes the usize has
+    let is_64_bit = (usize::max_value() as u64) == u64::max_value();
+    let max_len_bits = if is_64_bit { 64 } else { 32 };
+
+    if next_power_of_two > max_len_bits {
+        return None;
+    }
+
+    let mut final_vec = vec![0; next_power_of_two];
+
+    assert!(bit_vec.len() <= final_vec.len());
+
+    for (i, b) in bit_vec.into_iter().enumerate() {
+        final_vec[remaining_len + i] = bit_to_u8(b);
+    }
+
+    assert!(final_vec.len() % 8 == 0);
+
+    // now we have the bits in the correct order, 0000010101010 etc.
+
+    // pad out to 32 / 64 bits
+    assert!(max_len_bits >= final_vec.len());
+    let missing_to_usize_bit_len = max_len_bits - final_vec.len(); 
+
+    if missing_to_usize_bit_len != 0 {
+        let mut temp_vec = vec![0; missing_to_usize_bit_len];
+        temp_vec.append(&mut final_vec);
+        final_vec = temp_vec;
+    }
+
+    assert!(final_vec.len() == max_len_bits);
+
+    let mut final_num: usize = 0;
+
+    for i in 0..max_len_bits {
+        final_num |= (final_vec[i] as usize) << (max_len_bits - i - 1);
+    }
+
+    Some(final_num)
+}
+
+#[test]
+fn ue7_decode_test_1() {
+    assert_eq!(ue7_decode(&[0x08]), Some(8));
+}
+
+#[test]
+fn ue7_decode_test_2() {
+    assert_eq!(ue7_decode(&[0x84, 0x1e]), Some(542));
+}
+
+#[test]
+fn ue7_decode_test_3() {
+    assert_eq!(ue7_decode(&[0xac, 0xbe, 0x17]), Some(728855));
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +141,7 @@ pub struct BpgFile {
     pub bit_depth_minus_8: BitDepthMinus8,
     pub color_space: ColorSpace,
     pub extension_present: ExtensionPresent,
-    pub limited_range: LimitedRange,
+    pub limited_range: HasLimitedRange,
     pub animation: AnimationFlag,
 }
 
@@ -289,31 +372,31 @@ impl Into<u8> for ExtensionPresent {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum LimitedRange {
-    NotLimited,
-    Limited,
+pub enum HasLimitedRange {
+    FullRange,
+    LimitedRange,
 }
 
-impl LimitedRange {
+impl HasLimitedRange {
     fn from_u8(data: u8) -> Self {
-        use LimitedRange::*;
+        use HasLimitedRange::*;
         // [_, _, _, _, FLAG, _, _, _]
         let data: u8 = (data & 0b00000010) >> 1;
         // [0, 0, 0, 0, 0, 0, 0, FLAG]
         match data {
-            0 => NotLimited,
-            1 => Limited,
+            0 => FullRange,
+            1 => LimitedRange,
             _ => unreachable!()
         }
     }
 }
 
-impl Into<u8> for LimitedRange {
+impl Into<u8> for HasLimitedRange {
     fn into(self) -> u8 {
-        use LimitedRange::*;
+        use HasLimitedRange::*;
         match self {
-            NotLimited => 0,
-            Limited => 1,
+            FullRange => 0,
+            LimitedRange => 1,
         }
     }
 }
@@ -384,8 +467,13 @@ pub fn decode<R: ReadBytesExt>(bytes: &mut R) -> Result<BpgFile, BpgDecodeError>
     let color_space = ColorSpace::try_from_u8(third_byte, &pixel_format)?;
     let extension_present_flag = ExtensionPresent::from_u8(third_byte);
     let has_premutliplied_alpha = HasPremultipliedAlpha::from_u8(third_byte);
-    let limited_range_flag = LimitedRange::from_u8(third_byte);
+    let limited_range_flag = HasLimitedRange::from_u8(third_byte);
     let animation_flag = AnimationFlag::from_u8(third_byte);
+
+    let width_bytes = [bytes.read_u8()?, bytes.read_u8()?, bytes.read_u8()?, bytes.read_u8()?];
+    
+    let width = ue7_decode(&width_bytes);
+    println!("width: {:?}", width);
 
     Ok(BpgFile {
         pixel_format: pixel_format,
