@@ -3,6 +3,8 @@ extern crate byteorder;
 use std::io;
 use byteorder::{BigEndian, ReadBytesExt};
 
+pub mod exp_golomb;
+
 pub const FILE_MAGIC: u32 = 0x425047fb;
 
 /// Decodes a ue7(n) value.
@@ -106,6 +108,12 @@ fn ue7_decode_test_3() {
 
 #[derive(Debug, Clone)]
 pub struct BpgFile {
+    pub header: BpgFileHeader,
+    pub frame: HevcFrame,
+}
+
+#[derive(Debug, Clone)]
+pub struct BpgFileHeader {
     pub pixel_format: PixelFormat,
     pub alpha: (AlphaPlanePresent, HasPremultipliedAlpha),
     pub bit_depth_minus_8: BitDepthMinus8,
@@ -115,6 +123,8 @@ pub struct BpgFile {
     pub animation: AnimationFlag,
     pub width: usize,
     pub height: usize,
+    pub extensions: Vec<Extension>,
+    pub picture_data_length: usize,
 }
 
 #[derive(Debug)]
@@ -192,7 +202,7 @@ impl AlphaPlanePresent {
     fn from_u8(data: u8) -> Self {
         use AlphaPlanePresent::*;
         // [_, _, _, FLAG, _, _, _, _]
-        let data: u8 = (data & 0b00010000) >> 4;
+        let data: u8 = (data & 0b0001000) >> 4;
         // [0, 0, 0, 0, 0, 0, 0, FLAG]
         match data {
             0 => NoAlphaPresent,
@@ -405,6 +415,30 @@ impl Into<u8> for AnimationFlag {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Extension {
+    pub ext_type: ExtensionType,
+    pub ext_data: ExtensionData,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionType {
+    /// EXIF data
+    Exif = 1,
+    /// ICC profile (see [4])
+    IccProfile = 2,
+    /// XMP (see [5])
+    Xmp = 3,
+    /// Thumbnail (the thumbnail shall be a lower resolution version
+    /// of the image and stored in BPG format).
+    Thumbnail = 4,
+    /// Animation control data
+    AnimationControl = 5,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionData(pub Vec<u8>);
+
 /// Decodes a BPG file
 pub fn decode<R: ReadBytesExt>(bytes: &mut R) -> Result<BpgFile, BpgDecodeError> {
 
@@ -443,10 +477,35 @@ pub fn decode<R: ReadBytesExt>(bytes: &mut R) -> Result<BpgFile, BpgDecodeError>
     let limited_range_flag = HasLimitedRange::from_u8(third_byte);
     let animation_flag = AnimationFlag::from_u8(third_byte);
     
-    let width = ue7_decode(bytes, 4)?;
-    let height = ue7_decode(bytes, 4)?;
+    /*
+        picture_width                                               ue7(32)
+        picture_height                                              ue7(32)
+        picture_data_length                                         ue7(32)
+    */
 
-    Ok(BpgFile {
+    // TODO: Width of 0 not allowed
+    let picture_width = ue7_decode(bytes, 4)?;
+    // TODO: Height of 0 not allowed
+    let picture_height = ue7_decode(bytes, 4)?;
+
+    // TODO: The special value of zero indicates that the picture data 
+    // goes up to the end of the file.
+    let picture_data_length = ue7_decode(bytes, 4)?;
+
+    /*
+        if (extension_present_flag)  
+            extension_data_length                                   ue7(32)
+            extension_data()
+        }
+    */
+
+    let mut extensions = Vec::new();
+    if extension_present_flag == ExtensionPresent::Present {
+        let extension_data_length = ue7_decode(bytes, 4)?;
+        extensions = decode_extension_data(bytes, extension_data_length)?;
+    }
+
+    let bpg_file_header = BpgFileHeader {
         pixel_format: pixel_format,
         alpha: (alpha_plane_present, has_premutliplied_alpha),
         bit_depth_minus_8: bit_depth_minus_8,
@@ -454,7 +513,134 @@ pub fn decode<R: ReadBytesExt>(bytes: &mut R) -> Result<BpgFile, BpgDecodeError>
         extension_present: extension_present_flag,
         limited_range: limited_range_flag,
         animation: animation_flag,
-        width: width,
-        height: height,
+        width: picture_width,
+        height: picture_height,
+        extensions: extensions,
+        picture_data_length: picture_data_length,
+    };
+
+    let hevc_frame = decode_hevc_header_and_data(bytes, &bpg_file_header)?;
+
+    Ok(BpgFile {
+        header: bpg_file_header,
+        frame: hevc_frame,
     })
+}
+
+fn decode_extension_data<R: ReadBytesExt>(bytes: &mut R, max_length: usize) -> Result<Vec<Extension>, BpgDecodeError> {
+
+    // at least advance the pointer, even if the result is thrown away
+    for _ in 0..max_length {
+        // TODO: process the extensions correctly !! 
+        let _b = bytes.read_u8()?;
+    }
+
+    Ok(Vec::new())
+}
+
+#[derive(Debug, Clone)]
+pub struct HevcFrame {
+    header: HevcHeader,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HevcHeader {
+
+}
+
+fn decode_hevc_header_and_data<R: ReadBytesExt>(bytes: &mut R, file_header: &BpgFileHeader) -> Result<HevcFrame, BpgDecodeError>
+{
+    let hevc_header = decode_hevc_header(bytes, file_header)?;
+     /*
+         if (alpha1_flag || alpha2_flag) {
+             hevc_header()
+         }
+         hevc_header()
+         hevc_data()
+     */
+     let mut data_vec = Vec::new();
+     let data = if file_header.picture_data_length == 0 {
+        bytes.read_to_end(&mut data_vec)?;
+     } else {
+        data_vec.resize(file_header.picture_data_length, 0);
+        bytes.read_exact(&mut data_vec)?;
+     };
+
+     Ok(HevcFrame {
+        header: hevc_header,
+        data: data_vec,
+     })
+}
+
+/// - ue(v): unsigned integer 0-th order Exp-Golomb-coded syntax element with the left bit first. The parsing
+/// process for this descriptor is specified in clause 9.2.
+pub fn ue_decode<R: ReadBytesExt>(bytes: &mut R) {
+
+}
+
+fn decode_hevc_header<R: ReadBytesExt>(bytes: &mut R, file_header: &BpgFileHeader) -> Result<HevcHeader, BpgDecodeError> {
+    /*
+        hevc_header_length                                          ue7(32)
+        log2_min_luma_coding_block_size_minus3                      ue(v)
+        log2_diff_max_min_luma_coding_block_size                    ue(v)
+        log2_min_transform_block_size_minus2                        ue(v)
+        log2_diff_max_min_transform_block_size                      ue(v)
+        max_transform_hierarchy_depth_intra                         ue(v)
+        sample_adaptive_offset_enabled_flag                         u(1)
+        pcm_enabled_flag                                            u(1)
+    */
+
+    let hevc_header_length = ue7_decode(bytes, 4);
+
+    Ok(HevcHeader {
+
+    })
+}
+
+pub fn recover_non_premultiplied_rgb(r: u8, g: u8, b: u8, a: u8) -> (f32, f32, f32) {
+    /*
+        alpha1_flag=1 alpha2_flag=1: alpha present. The color is premultiplied. 
+        The resulting non-premultiplied R', G', B' shall
+               be recovered as:
+                  
+                 if A != 0 
+                   R' = min(R / A, 1), G' = min(G / A, 1), B' = min(B / A, 1)
+                 else
+                   R' = G' = B' = 1 .
+    */
+
+    if a != 0 {
+        let r = (r as f32 / a as f32).min(1.0);
+        let g = (g as f32 / a as f32).min(1.0);
+        let b = (b as f32 / a as f32).min(1.0);
+        (r, g, b)
+    } else {
+        (1.0, 1.0, 1.0)
+    }
+}
+
+pub fn recover_cmyk(r: f32, g: f32, b: f32, w: f32) -> (f32, f32, f32, f32) {
+    
+    /*
+        alpha1_flag=0 alpha2_flag=1: the alpha plane is present and
+        contains the W color component (CMYK color). The resulting CMYK
+        data can be recovered as follows:
+
+          C = (1 - R), M = (1 - G), Y = (1 - B), K = (1 - W) .
+    */
+
+    let c = 1.0 - r;
+    let m = 1.0 - g;
+    let y = 1.0 - b;
+    let k = 1.0 - w;
+    (c, m, y, k)
+}
+
+pub fn recover_limited_range_y() {
+    /*
+             - (16 << (bit_depth - 8) to (235 << (bit_depth - 8)) for Y
+        and G, B, R,
+             - (16 << (bit_depth - 8) to (240 << (bit_depth - 8)) for Cb and Cr.
+    */
 }
