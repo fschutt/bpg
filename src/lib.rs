@@ -1,4 +1,5 @@
 extern crate byteorder;
+extern crate smallvec;
 
 use std::io;
 use byteorder::{BigEndian, ReadBytesExt};
@@ -22,7 +23,10 @@ pub const FILE_MAGIC: u32 = 0x425047fb;
 /// 0xac 0xbe 0x17      728855
 pub fn ue7_decode<R: ReadBytesExt>(bytes: &mut R, max_bytes: usize) -> Result<usize, BpgDecodeError> {
     
-    let mut bit_vec = Vec::<bool>::with_capacity(16);
+    use smallvec::SmallVec;
+
+    // the usual size is 4 bytes, which is why it makes sense to use smallvec here
+    let mut bit_vec = SmallVec::<[bool; 32]>::new(); // should use 28 items for 4 bytes
 
     let mut is_last_byte = false;
     let mut read_bytes = 0;
@@ -55,7 +59,12 @@ pub fn ue7_decode<R: ReadBytesExt>(bytes: &mut R, max_bytes: usize) -> Result<us
         return Err(BpgDecodeError::OverflowingUnsignedInteger(next_power_of_two));
     }
 
-    let mut final_vec = vec![0; next_power_of_two];
+    // since the usize cannot hold more than 64 bits without overflowing,
+    // we should use the maximum of 64 bits here
+    let mut final_vec = SmallVec::<[u8; 64]>::new();
+    for _ in 0..next_power_of_two {
+        final_vec.push(0);
+    }
 
     assert!(bit_vec.len() <= final_vec.len());
 
@@ -72,8 +81,14 @@ pub fn ue7_decode<R: ReadBytesExt>(bytes: &mut R, max_bytes: usize) -> Result<us
     let missing_to_usize_bit_len = max_len_bits - final_vec.len(); 
 
     if missing_to_usize_bit_len != 0 {
-        let mut temp_vec = vec![0; missing_to_usize_bit_len];
-        temp_vec.append(&mut final_vec);
+        let mut temp_vec = SmallVec::<[u8; 64]>::new();
+        // missing_to_usize_bit_len
+        for _ in 0..missing_to_usize_bit_len { 
+            temp_vec.push(0);
+        }
+        for e in final_vec.iter() {
+            temp_vec.push(*e);
+        }
         final_vec = temp_vec;
     }
 

@@ -5,3 +5,4 @@ authors = ["Felix Schütt <felix.schuett@maps4print.com>"]
 
 [dependencies]
 byteorder = "1.2.1"
+smallvec = "0.6.0"

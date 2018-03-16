@@ -1,12 +1,31 @@
 //! Exp-golomb coding
 
-use byteorder::{BigEndian, ReadBytesExt};
+use byteorder::ReadBytesExt;
+use std::io::Cursor;
 
-pub struct ExpGolombEncoder {
-
+pub struct ExpGolombDecoder<R: ReadBytesExt> {
+    pub data: R,
+    /// The bits we've already taken but not completely used
+    /// (for incomplete values)
+    pub last_bytes: Vec<u8>,
+    /// Bit lag into the last byte
+    pub bit_lag_current_byte: u8,
+    /// Total bit lag
+    pub bit_lag_total: isize,
 }
 
-pub struct ExpGolombDecoder {
+impl<R: ReadBytesExt> ExpGolombDecoder<R> {
+    pub fn new(data: R) -> Self {
+        Self {
+            data: data,
+            last_bytes: Vec::new(),
+            bit_lag_current_byte: 0,
+            bit_lag_total: 0,
+        }
+    }
+}
+
+pub struct ExpGolombEncoder {
 
 }
 
@@ -15,11 +34,13 @@ pub enum ExpGolombEncodeError {
 
 }
 
-pub fn exp_golomb_decode<R: ReadBytesExt>(data: &mut R) -> Result<Vec<usize>, ExpGolombEncodeError> {
-    
+pub fn exp_golomb_decode<R: ReadBytesExt>(decoder: &mut ExpGolombDecoder<R>, max_bytes: Option<usize>) 
+    -> Result<Vec<usize>, ExpGolombEncodeError> 
+{    
+    // TODO: 32-bit / 64-bit overflow correctness!
+
     let mut result = Vec::<usize>::new();
-    let mut current_bit: isize = 0; // carry bit for in-between byte-encoding
-    let mut last_bytes: Option<Vec<u8>> = None;
+    let mut current_bit: isize = 0; 
 
     #[derive(Debug, PartialEq)]
     enum Status {
@@ -29,11 +50,7 @@ pub fn exp_golomb_decode<R: ReadBytesExt>(data: &mut R) -> Result<Vec<usize>, Ex
 
     let mut status = Status::NeedNextByte;
 
-    let mut debug_loop_counter = 0;
-
     'outer: loop {
-
-        println!("entering loop {}", debug_loop_counter);
 
         // if we have a byte stream like this: 
         // [0, 0, 1, 1, 1, | 0, 0, 0, 0] = 6
@@ -44,7 +61,6 @@ pub fn exp_golomb_decode<R: ReadBytesExt>(data: &mut R) -> Result<Vec<usize>, Ex
         // leading_zeros = 2
         // bits_to_read = 3
         // total = 5
-        // start_position = 
         //
         // 7 = 0b111
         // 6 = (7 - 1)
@@ -60,11 +76,10 @@ pub fn exp_golomb_decode<R: ReadBytesExt>(data: &mut R) -> Result<Vec<usize>, Ex
                 */
                 
                 {   
-                    let last_b: &Vec<u8> = match last_bytes.as_ref() {
+                    let last_byte = match decoder.last_bytes.last() {
                         Some(s) => s,
                         None => break 'outer,
                     };
-                    let last_byte = last_b[last_b.len() - 1];
                     let leading_z = last_byte.leading_zeros() as usize;
                     let bits_to_read = leading_z + 1;
                     
@@ -86,53 +101,83 @@ pub fn exp_golomb_decode<R: ReadBytesExt>(data: &mut R) -> Result<Vec<usize>, Ex
                             num |= (last_bit as usize) << (bits_to_read as isize -1 - (bit_counter as isize));
                             bit_counter += 1;
                         }
+
                         num -= 1;
                         result.push(num);
                         status = Status::Ok;
                     }
                 }
-                last_bytes = None;
+                decoder.last_bytes = Vec::new();
             },
             Status::NeedNextByte => {
-                // push an extra byte
-                if let Ok(next_byte) = data.read_u8() {
-                    match last_bytes {
-                        None => { 
-                            last_bytes = Some(vec![next_byte]); 
-                        }
-                        Some(ref mut l) => { 
-                            l.push(next_byte); 
-                        } 
+                if let Some(max) = max_bytes {
+                    if result.len() == max {
+                        break 'outer;
                     }
+                }
+
+                if let Ok(next_byte) = decoder.data.read_u8() {
+                    decoder.last_bytes.push(next_byte);
                     status = Status::Ok;
                 } else {
                     break 'outer;
                 }
             }
         }
-
-        debug_loop_counter += 1;
     }
 
     Ok(result)
 }
 
-pub fn exp_golomb_encode(data: &Vec<usize>) -> Result<Vec<u8>, ExpGolombEncodeError> {
+pub fn exp_golomb_encode(_data: &Vec<usize>) -> Result<Vec<u8>, ExpGolombEncodeError> {
     Ok(Vec::new())
 }
 
 #[test]
-fn test_exp_golomb_decode() {
-    use std::io::Cursor;
-    assert_eq!(exp_golomb_decode(&mut Cursor::new(vec![0b10000000])).unwrap(), vec![0]);
-    assert_eq!(exp_golomb_decode(&mut Cursor::new(vec![0b01000000])).unwrap(), vec![1]);
-    assert_eq!(exp_golomb_decode(&mut Cursor::new(vec![0b01100000])).unwrap(), vec![2]);
-    assert_eq!(exp_golomb_decode(&mut Cursor::new(vec![0b00100000])).unwrap(), vec![3]);
-    assert_eq!(exp_golomb_decode(&mut Cursor::new(vec![0b00101000])).unwrap(), vec![4]);
-    assert_eq!(exp_golomb_decode(&mut Cursor::new(vec![0b00110000])).unwrap(), vec![5]);
-    assert_eq!(exp_golomb_decode(&mut Cursor::new(vec![0b00111000])).unwrap(), vec![6]);
-    assert_eq!(exp_golomb_decode(&mut Cursor::new(vec![0b00010000])).unwrap(), vec![7]);
-    assert_eq!(exp_golomb_decode(&mut Cursor::new(vec![0b00010010])).unwrap(), vec![8]);
+fn test_exp_golomb_decode_multiple_values() {
+    let mut c = Cursor::new(vec![0b11111111]);
+    let mut decoder = ExpGolombDecoder::new(&mut c);
+    assert_eq!(exp_golomb_decode(&mut decoder, None).unwrap(), vec![0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn test_exp_golomb_decode_single_value() {
+
+    let mut c = Cursor::new(vec![0b10000000]);
+    let mut decoder = ExpGolombDecoder::new(&mut c);
+    assert_eq!(exp_golomb_decode(&mut decoder, None).unwrap(), vec![0]);
+
+    let mut c = Cursor::new(vec![0b01000000]);
+    let mut decoder = ExpGolombDecoder::new(&mut c);
+    assert_eq!(exp_golomb_decode(&mut decoder, None).unwrap(), vec![1]);
+
+    let mut c = Cursor::new(vec![0b01100000]);
+    let mut decoder = ExpGolombDecoder::new(&mut c);
+    assert_eq!(exp_golomb_decode(&mut decoder, None).unwrap(), vec![2]);
+
+    let mut c = Cursor::new(vec![0b00100000]);
+    let mut decoder = ExpGolombDecoder::new(&mut c);
+    assert_eq!(exp_golomb_decode(&mut decoder, None).unwrap(), vec![3]);
+
+    let mut c = Cursor::new(vec![0b00101000]);
+    let mut decoder = ExpGolombDecoder::new(&mut c);
+    assert_eq!(exp_golomb_decode(&mut decoder, None).unwrap(), vec![4]);
+
+    let mut c = Cursor::new(vec![0b00110000]);
+    let mut decoder = ExpGolombDecoder::new(&mut c);
+    assert_eq!(exp_golomb_decode(&mut decoder, None).unwrap(), vec![5]);
+
+    let mut c = Cursor::new(vec![0b00111000]);
+    let mut decoder = ExpGolombDecoder::new(&mut c);
+    assert_eq!(exp_golomb_decode(&mut decoder, None).unwrap(), vec![6]);
+
+    let mut c = Cursor::new(vec![0b00010000]);
+    let mut decoder = ExpGolombDecoder::new(&mut c);
+    assert_eq!(exp_golomb_decode(&mut decoder, None).unwrap(), vec![7]);
+
+    let mut c = Cursor::new(vec![0b00010010]);
+    let mut decoder = ExpGolombDecoder::new(&mut c);
+    assert_eq!(exp_golomb_decode(&mut decoder, None).unwrap(), vec![8]);
 }
 
 #[test]
